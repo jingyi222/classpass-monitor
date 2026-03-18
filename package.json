@@ -1,0 +1,17 @@
+{
+  "name": "classpass-monitor",
+  "version": "2.0.0",
+  "description": "Monitors ClassPass reviews and sends Telegram notifications",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "node-cron": "^3.0.3",
+    "puppeteer": "^21.0.0"
+  }
+}
