@@ -8,8 +8,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const CHECK_INTERVAL_MINS = parseInt(process.env.CHECK_INTERVAL_MINS || "30");
 const INSTRUCTOR_NAME = process.env.INSTRUCTOR_NAME || "";
 const RATING_FILTER = process.env.RATING_FILTER || "all";
-const CLASSPASS_EMAIL = process.env.CLASSPASS_EMAIL;
-const CLASSPASS_PASSWORD = process.env.CLASSPASS_PASSWORD;
+const CLASSPASS_COOKIE = process.env.CLASSPASS_COOKIE;
 
 const STUDIOS = (process.env.STUDIOS || "")
   .split(",")
@@ -23,7 +22,6 @@ const STUDIOS = (process.env.STUDIOS || "")
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const seenReviews = {};
 let isFirstRun = true;
-let sessionCookie = null;
 let telegramOffset = 0;
 
 // ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -71,61 +69,15 @@ async function pollTelegramCommands() {
   } catch (_) {}
 }
 
-// ─── CLASSPASS LOGIN ──────────────────────────────────────────────────────────
-async function loginToClassPass() {
-  if (!CLASSPASS_EMAIL || !CLASSPASS_PASSWORD) return false;
-  try {
-    console.log("[login] Logging in to ClassPass...");
-
-    // Step 1: Get CSRF token
-    const initRes = await fetch("https://classpass.com/login", {
-      headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15" },
-    });
-    const initCookies = initRes.headers.raw()["set-cookie"] || [];
-    const csrfCookie = initCookies.find(c => c.includes("csrf")) || "";
-    const csrfToken = csrfCookie.match(/csrf[_-]?token=([^;]+)/i)?.[1] || "";
-    const cookieHeader = initCookies.map(c => c.split(";")[0]).join("; ");
-
-    // Step 2: POST login
-    const loginRes = await fetch("https://classpass.com/api/auth/login", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Cookie": cookieHeader,
-        "X-CSRF-Token": csrfToken,
-        "Referer": "https://classpass.com/login",
-        "Origin": "https://classpass.com",
-      },
-      body: JSON.stringify({ email: CLASSPASS_EMAIL, password: CLASSPASS_PASSWORD }),
-    });
-
-    const loginCookies = loginRes.headers.raw()["set-cookie"] || [];
-    if (loginCookies.length === 0 && loginRes.status !== 200) {
-      console.error("[login] Failed, status:", loginRes.status);
-      await sendTelegram("⚠️ ClassPass login failed. Check CLASSPASS_EMAIL and CLASSPASS_PASSWORD in Railway.");
-      return false;
-    }
-
-    // Merge all cookies
-    const allCookies = [...initCookies, ...loginCookies];
-    sessionCookie = allCookies.map(c => c.split(";")[0]).join("; ");
-    console.log("[login] Logged in successfully!");
-    return true;
-  } catch (e) {
-    console.error("[login] Error:", e.message);
-    return false;
-  }
-}
-
 // ─── FETCH PAGE ───────────────────────────────────────────────────────────────
 async function fetchPageHTML(url) {
   const res = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-      "Cookie": sessionCookie || "",
-      "Accept": "text/html,application/xhtml+xml",
+      "Cookie": `ndp_session=${CLASSPASS_COOKIE}`,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://classpass.com",
     },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -142,7 +94,7 @@ async function parseReviewsWithClaude(html, studioName) {
     .replace(/<img[^>]*>/gi, "")
     .substring(0, 14000);
 
-  const prompt = `Extract all reviews from this ClassPass page for studio "${studioName}".
+  const prompt = `Extract all reviews from this ClassPass page for studio "${studioName}". The user is logged in so instructor names should be visible.
 
 Return a JSON array with fields:
 - id: unique string (combine stars+text+date, no spaces)
@@ -153,7 +105,7 @@ Return a JSON array with fields:
 - instructor: instructor name shown or empty string
 - mentions_instructor: true if instructor field contains "${INSTRUCTOR_NAME}" (case-insensitive) OR review text mentions "${INSTRUCTOR_NAME}"
 
-Return ONLY valid JSON array, no markdown. Return [] if no reviews.
+Return ONLY valid JSON array, no markdown. Return [] if no reviews found.
 
 HTML:
 ${stripped}`;
@@ -171,10 +123,6 @@ ${stripped}`;
 
 // ─── SEND ALL REVIEWS ─────────────────────────────────────────────────────────
 async function sendAllReviews() {
-  if (!sessionCookie) {
-    const ok = await loginToClassPass();
-    if (!ok) { await sendTelegram("❌ Could not log in to ClassPass."); return; }
-  }
   let grandTotal = 0;
   for (const studio of STUDIOS) {
     let html;
@@ -211,12 +159,7 @@ async function checkStudio(studio) {
   const seen = seenReviews[studio.name];
   let html;
   try { html = await fetchPageHTML(studio.url); }
-  catch (e) {
-    console.error(`[check] Fetch failed: ${e.message}`);
-    sessionCookie = null;
-    await loginToClassPass();
-    return;
-  }
+  catch (e) { console.error(`[check] Fetch failed: ${e.message}`); return; }
   let reviews;
   try { reviews = await parseReviewsWithClaude(html, studio.name); }
   catch (e) { console.error(`[check] Parse error: ${e.message}`); return; }
@@ -254,10 +197,6 @@ async function checkStudio(studio) {
 // ─── CHECK ALL ────────────────────────────────────────────────────────────────
 async function checkAll() {
   console.log(`\n[${new Date().toISOString()}] Checking ${STUDIOS.length} studio(s)...`);
-  if (!sessionCookie) {
-    const ok = await loginToClassPass();
-    if (!ok) { console.error("[check] Not logged in, skipping."); return; }
-  }
   for (const studio of STUDIOS) {
     await checkStudio(studio);
     await new Promise(r => setTimeout(r, 3000));
@@ -274,8 +213,7 @@ function validateConfig() {
   if (!TELEGRAM_TOKEN) errors.push("TELEGRAM_TOKEN");
   if (!TELEGRAM_CHAT_ID) errors.push("TELEGRAM_CHAT_ID");
   if (!ANTHROPIC_API_KEY) errors.push("ANTHROPIC_API_KEY");
-  if (!CLASSPASS_EMAIL) errors.push("CLASSPASS_EMAIL");
-  if (!CLASSPASS_PASSWORD) errors.push("CLASSPASS_PASSWORD");
+  if (!CLASSPASS_COOKIE) errors.push("CLASSPASS_COOKIE");
   if (STUDIOS.length === 0) errors.push("STUDIOS");
   if (!INSTRUCTOR_NAME) errors.push("INSTRUCTOR_NAME");
   if (errors.length > 0) { console.error("❌ Missing:", errors.join(", ")); process.exit(1); }
