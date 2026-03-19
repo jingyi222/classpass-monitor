@@ -5,7 +5,6 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const CHECK_INTERVAL_MINS = parseInt(process.env.CHECK_INTERVAL_MINS || "30");
-const INSTRUCTOR_NAME = process.env.INSTRUCTOR_NAME || "";
 const RATING_FILTER = process.env.RATING_FILTER || "all";
 
 const STUDIOS = (process.env.STUDIOS || "")
@@ -46,18 +45,35 @@ async function pollTelegramCommands() {
       const chatId = update.message?.chat?.id?.toString();
       if (chatId !== TELEGRAM_CHAT_ID) continue;
       if (text === "/reviews") { await sendTelegram("🔍 Fetching all reviews..."); await sendAllReviews(); }
-      else if (text === "/help") await sendTelegram(`📋 <b>Commands</b>\n/reviews — All current reviews across your studios\n/help — This message`);
+      else if (text === "/help") await sendTelegram(`📋 <b>Commands</b>\n/reviews — All current reviews\n/help — This message`);
     }
   } catch (_) {}
 }
 
+// Try multiple proxies in order
 async function fetchPageHTML(url) {
-  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-  const res = await fetch(proxyUrl, { timeout: 20000 });
-  if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
-  const data = await res.json();
-  if (!data.contents) throw new Error("Empty response");
-  return data.contents;
+  const proxies = [
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`),
+    () => fetch(`https://thingproxy.freeboard.io/fetch/${url}`),
+    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`),
+  ];
+
+  for (const proxyFn of proxies) {
+    try {
+      const res = await proxyFn();
+      if (res.ok) {
+        const text = await res.text();
+        if (text && text.length > 500) {
+          console.log(`[fetch] Success with proxy`);
+          return text;
+        }
+      }
+      console.log(`[fetch] Proxy returned ${res.status}, trying next...`);
+    } catch (e) {
+      console.log(`[fetch] Proxy failed: ${e.message}, trying next...`);
+    }
+  }
+  throw new Error("All proxies failed for " + url);
 }
 
 async function parseReviewsWithClaude(html, studioName) {
