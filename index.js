@@ -50,53 +50,84 @@ async function pollTelegramCommands() {
   } catch (_) {}
 }
 
-// Try multiple proxies in order
-async function fetchPageHTML(url) {
+async function proxyFetch(url) {
   const proxies = [
     () => fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`),
+    () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`).then(async r => {
+      const j = await r.json(); return { ok: !!j.contents, text: () => Promise.resolve(j.contents) };
+    }),
     () => fetch(`https://thingproxy.freeboard.io/fetch/${url}`),
     () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`),
   ];
-
-  for (const proxyFn of proxies) {
+  for (const fn of proxies) {
     try {
-      const res = await proxyFn();
+      const res = await fn();
       if (res.ok) {
         const text = await res.text();
-        if (text && text.length > 500) {
-          console.log(`[fetch] Success with proxy`);
-          return text;
-        }
+        if (text && text.length > 200) return text;
       }
-      console.log(`[fetch] Proxy returned ${res.status}, trying next...`);
-    } catch (e) {
-      console.log(`[fetch] Proxy failed: ${e.message}, trying next...`);
-    }
+    } catch (_) {}
   }
-  throw new Error("All proxies failed for " + url);
+  throw new Error("All proxies failed");
 }
 
-async function parseReviewsWithClaude(html, studioName) {
+// Extract venue ID from ClassPass URL or HTML, then call reviews API
+async function fetchReviews(studioUrl) {
+  // Try to get venue slug from URL
+  // ClassPass URLs: classpass.com/classes/studio-name--city-VENUEID
+  const slugMatch = studioUrl.match(/\/classes\/([^?#/]+)/);
+  const slug = slugMatch?.[1] || "";
+
+  // Try ClassPass API endpoints directly
+  const apiEndpoints = [
+    `https://classpass.com/api/v1/venues/${slug}/reviews?limit=50`,
+    `https://classpass.com/_api/v1/venues/${slug}/reviews?limit=50`,
+  ];
+
+  for (const apiUrl of apiEndpoints) {
+    try {
+      const text = await proxyFetch(apiUrl);
+      const json = JSON.parse(text);
+      if (json && (json.results || json.reviews || Array.isArray(json))) {
+        console.log(`[fetch] Got API response for ${slug}`);
+        return { type: "api", data: json };
+      }
+    } catch (_) {}
+  }
+
+  // Fall back to full page
+  const html = await proxyFetch(studioUrl);
+  return { type: "html", data: html };
+}
+
+async function parseReviewsWithClaude(content, studioName) {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
-  const stripped = html
+
+  let contentStr = typeof content.data === "string"
+    ? content.data
+    : JSON.stringify(content.data);
+
+  contentStr = contentStr
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<svg[\s\S]*?<\/svg>/gi, "")
     .substring(0, 14000);
 
-  const prompt = `Extract all reviews from this ClassPass page for studio "${studioName}".
+  const prompt = `Extract all reviews from this ClassPass content for studio "${studioName}". This could be JSON API data or HTML.
+
+Look carefully for review/rating data. In JSON look for arrays with rating, review_text, created_at fields. In HTML look for star ratings and review text.
 
 Return a JSON array with:
-- id: unique string (combine stars+text+date)
-- stars: 1-5 integer (0 if unknown)
+- id: unique string (combine rating+text+date)
+- stars: 1-5 integer (0 if unknown)  
 - text: review text or ""
 - date: date string or ""
 - class_name: class name or ""
 
-ONLY return valid JSON array, no markdown. Return [] if no reviews found.
+ONLY return valid JSON array, no markdown. Return [] if truly no reviews.
 
-HTML:
-${stripped}`;
+Content (${content.type}):
+${contentStr}`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -112,11 +143,11 @@ ${stripped}`;
 async function sendAllReviews() {
   let grandTotal = 0;
   for (const studio of STUDIOS) {
-    let html;
-    try { html = await fetchPageHTML(studio.url); }
+    let content;
+    try { content = await fetchReviews(studio.url); }
     catch (e) { await sendTelegram(`❌ ${studio.name}: ${e.message}`); continue; }
     let reviews;
-    try { reviews = await parseReviewsWithClaude(html, studio.name); }
+    try { reviews = await parseReviewsWithClaude(content, studio.name); }
     catch (e) { await sendTelegram(`❌ Parse failed for ${studio.name}`); continue; }
 
     if (reviews.length === 0) { await sendTelegram(`🏢 <b>${studio.name}</b>\n\nNo reviews found.`); continue; }
@@ -139,11 +170,11 @@ async function checkStudio(studio) {
   console.log(`[check] ${studio.name}`);
   if (!seenReviews[studio.name]) seenReviews[studio.name] = new Set();
   const seen = seenReviews[studio.name];
-  let html;
-  try { html = await fetchPageHTML(studio.url); }
+  let content;
+  try { content = await fetchReviews(studio.url); }
   catch (e) { console.error(`[check] ${studio.name}: ${e.message}`); return; }
   let reviews;
-  try { reviews = await parseReviewsWithClaude(html, studio.name); }
+  try { reviews = await parseReviewsWithClaude(content, studio.name); }
   catch (e) { console.error(`[check] parse error: ${e.message}`); return; }
 
   console.log(`[check] ${studio.name}: ${reviews.length} review(s)`);
@@ -156,12 +187,10 @@ async function checkStudio(studio) {
     if (RATING_FILTER === "negative" && r.stars > 3) continue;
     const stars = "★".repeat(r.stars||0) + "☆".repeat(5-(r.stars||0));
     const msg = [
-      `🎯 <b>New Review at ${studio.name}!</b>`,
-      ``,
+      `🎯 <b>New Review at ${studio.name}!</b>`, ``,
       `${stars} (${r.stars}/5)`,
       r.class_name ? `📍 ${r.class_name}` : null,
-      r.date ? `📅 ${r.date}` : null,
-      ``,
+      r.date ? `📅 ${r.date}` : null, ``,
       r.text ? `"${r.text}"` : `(No written comment)`,
     ].filter(l => l !== null).join("\n");
     await sendTelegram(msg);
